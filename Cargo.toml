@@ -1,22 +1,12 @@
 [package]
-name = "bpf-program-template"
+name = "roshambo-sol"
 version = "0.1.0"
 edition = "2021"
-license = "WTFPL"
+license = "MIT"
 publish = false
 
 [dependencies]
 solana-program = "=1.16.1"
-
-[features]
-test-bpf = []
-
-[dev-dependencies]
-assert_matches = "1.4.0"
-solana-logger = "=1.16.1"
-solana-program-test = "=1.16.1"
-solana-sdk = "=1.16.1"
-solana-validator = "=1.16.1"
 
 [lib]
 crate-type = ["cdylib", "lib"]
