@@ -6,7 +6,10 @@ license = "MIT"
 publish = false
 
 [dependencies]
-solana-program = "=1.16.1"
+arrayref = "0.3.7"
+solana-program = "1.18.9"
+spl-token = { version = "4.0.1", features = ["no-entrypoint"] }
+thiserror = "1.0.58"
 
 [lib]
 crate-type = ["cdylib", "lib"]
