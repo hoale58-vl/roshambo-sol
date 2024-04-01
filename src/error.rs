@@ -12,6 +12,12 @@ pub enum RoshamboError {
     /// Not Rent Exempt
     #[error("Not Rent Exempt")]
     NotRentExempt,
+    /// Not Rent Exempt
+    #[error("GameEnded")]
+    GameEnded,
+    /// Amount Overflow
+    #[error("Amount Overflow")]
+    AmountOverflow,
 }
 
 impl From<RoshamboError> for ProgramError {
