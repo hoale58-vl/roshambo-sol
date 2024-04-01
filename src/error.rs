@@ -18,6 +18,9 @@ pub enum RoshamboError {
     /// Amount Overflow
     #[error("Amount Overflow")]
     AmountOverflow,
+    /// Amount Overflow
+    #[error("Invalid bet amount")]
+    InvalidBetAmount,
 }
 
 impl From<RoshamboError> for ProgramError {

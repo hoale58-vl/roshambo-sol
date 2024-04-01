@@ -1,6 +1,10 @@
 // program logic
 
-use crate::{error::RoshamboError, instruction::RoshamboInstruction, state::Game};
+use crate::{
+    error::RoshamboError,
+    instruction::RoshamboInstruction,
+    state::{Config, Game},
+};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
@@ -25,9 +29,16 @@ impl Processor {
         let instruction = RoshamboInstruction::unpack(instruction_data)?;
 
         match instruction {
+            RoshamboInstruction::Initialize {
+                min_bet_amount,
+                max_bet_amount,
+            } => {
+                msg!("Instruction: Initialize");
+                Self::process_initialize(accounts, min_bet_amount, max_bet_amount)
+            }
             RoshamboInstruction::NewGame { amount } => {
                 msg!("Instruction: NewGame");
-                Self::process_new_game(accounts, amount, program_id)
+                Self::process_new_game(accounts, amount)
             }
             RoshamboInstruction::ClaimReward {
                 host_seed,
@@ -36,14 +47,61 @@ impl Processor {
                 msg!("Instruction: Claim");
                 Self::process_claim(accounts, host_seed, public_seed, program_id)
             }
+            RoshamboInstruction::UpdateConfig {
+                min_bet_amount,
+                max_bet_amount,
+            } => {
+                msg!("Instruction: Update Config");
+                Self::process_update_config(accounts, min_bet_amount, max_bet_amount)
+            }
+            RoshamboInstruction::Withdraw { amount } => {
+                msg!("Instruction: Withdraw");
+                Self::process_withdraw(accounts, amount, program_id)
+            }
         }
     }
 
-    fn process_new_game(
+    fn process_initialize(
         accounts: &[AccountInfo],
-        amount: u64,
-        program_id: &Pubkey,
+        min_bet_amount: u64,
+        max_bet_amount: u64,
     ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+
+        let config_creator = next_account_info(account_info_iter)?;
+        if !config_creator.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        // Config Account (store config info data) -> Make sure fee exempt
+        let config_account = next_account_info(account_info_iter)?;
+
+        let rent = Rent::get()?;
+        if !rent.is_exempt(config_account.lamports(), config_account.data_len()) {
+            return Err(RoshamboError::NotRentExempt.into());
+        }
+
+        // Check if this config account is already initialize
+        let mut config_info = Config::unpack_unchecked(&config_account.try_borrow_data()?)?;
+        if config_info.is_initialized() {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+
+        let mint_token_account = next_account_info(account_info_iter)?;
+
+        // Update game account with new game data
+        config_info.is_initialized = true;
+        config_info.total_games = 0;
+        config_info.min_bet_amount = min_bet_amount;
+        config_info.max_bet_amount = max_bet_amount;
+        config_info.owner_pubkey = *config_creator.key;
+        config_info.mint_token_pubkey = *mint_token_account.key;
+        Config::pack(config_info, &mut config_account.try_borrow_mut_data()?)?;
+
+        Ok(())
+    }
+
+    fn process_new_game(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
 
         let game_creator = next_account_info(account_info_iter)?;
@@ -52,9 +110,21 @@ impl Processor {
         }
 
         let creator_token_account = next_account_info(account_info_iter)?;
+        let game_account = next_account_info(account_info_iter)?;
+        let house_token_account = next_account_info(account_info_iter)?;
+        let config_account = next_account_info(account_info_iter)?;
+
+        // Validate if this token account match with config account
+        // No need to check house_token_account because creator_token_account will transfer to house_token_account later on
+        let creator_token_account_info =
+            TokenAccount::unpack(&creator_token_account.try_borrow_data()?)?;
+        let mut config_account_info = Config::unpack(&config_account.try_borrow_data()?)?;
+
+        if creator_token_account_info.mint != config_account_info.mint_token_pubkey {
+            return Err(ProgramError::InvalidAccountData);
+        }
 
         // Game Account (store game info data) -> Make sure fee exempt
-        let game_account = next_account_info(account_info_iter)?;
         let rent = Rent::get()?;
         if !rent.is_exempt(game_account.lamports(), game_account.data_len()) {
             return Err(RoshamboError::NotRentExempt.into());
@@ -66,6 +136,25 @@ impl Processor {
             return Err(ProgramError::AccountAlreadyInitialized);
         }
 
+        // verify house token account
+        if *house_token_account.key != config_account_info.owner_pubkey {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // validate bet amount in range of max - min config
+        if amount < config_account_info.min_bet_amount
+            || amount > config_account_info.max_bet_amount
+        {
+            return Err(RoshamboError::InvalidBetAmount.into());
+        }
+
+        // increase total games by one
+        config_account_info.total_games += 1;
+        Config::pack(
+            config_account_info,
+            &mut config_account.try_borrow_mut_data()?,
+        )?;
+
         // Update game account with new game data
         game_info.is_initialized = true;
         game_info.bet_amount = amount;
@@ -73,19 +162,9 @@ impl Processor {
         game_info.result = COption::None;
         Game::pack(game_info, &mut game_account.try_borrow_mut_data()?)?;
 
-        let house_token_account = next_account_info(account_info_iter)?;
-        // verify house token account's authority is PDA
-        let house_token_account_info =
-            TokenAccount::unpack(&house_token_account.try_borrow_data()?)?;
-        // just need 1 PDA that can own N temporary token accounts
-        let (pda, _nonce) = Pubkey::find_program_address(&[b"roshambo"], program_id);
-        if pda != house_token_account_info.owner {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
         // CPI call token program transfer bet amount to house PDA
         let token_program = next_account_info(account_info_iter)?;
-        let owner_change_ix = spl_token::instruction::transfer(
+        let deposit_bet_ix = spl_token::instruction::transfer(
             token_program.key,
             creator_token_account.key,
             house_token_account.key,
@@ -96,7 +175,7 @@ impl Processor {
 
         msg!("Calling the token program to transfer token to house token account...");
         invoke(
-            &owner_change_ix,
+            &deposit_bet_ix,
             &[
                 creator_token_account.clone(),
                 house_token_account.clone(),
@@ -146,6 +225,14 @@ impl Processor {
 
         let receiver_account = next_account_info(account_info_iter)?;
         let house_token_account = next_account_info(account_info_iter)?;
+        let config_account = next_account_info(account_info_iter)?;
+
+        // validate if house token account match config
+        let config_account_info = Config::unpack(&config_account.try_borrow_data()?)?;
+        if *house_token_account.key != config_account_info.owner_pubkey {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
         let token_program = next_account_info(account_info_iter)?;
         let pda_program = next_account_info(account_info_iter)?;
 
@@ -153,7 +240,7 @@ impl Processor {
         if selection == host_result {
             game_info.result = COption::Some(2);
             // refund bet amount
-            let owner_change_ix = spl_token::instruction::transfer(
+            let refund_ix = spl_token::instruction::transfer(
                 token_program.key,
                 house_token_account.key,
                 receiver_account.key,
@@ -164,7 +251,7 @@ impl Processor {
 
             msg!("Refund bet amount when draw...");
             invoke_signed(
-                &owner_change_ix,
+                &refund_ix,
                 &[
                     house_token_account.clone(),
                     receiver_account.clone(),
@@ -182,7 +269,7 @@ impl Processor {
                 // Win
                 game_info.result = COption::Some(0);
 
-                let owner_change_ix = spl_token::instruction::transfer(
+                let claim_reward_ix = spl_token::instruction::transfer(
                     token_program.key,
                     house_token_account.key,
                     receiver_account.key,
@@ -191,9 +278,9 @@ impl Processor {
                     game_info.bet_amount * 2,
                 )?;
 
-                msg!("Refund bet amount when draw...");
+                msg!("Claim win reward...");
                 invoke_signed(
-                    &owner_change_ix,
+                    &claim_reward_ix,
                     &[
                         house_token_account.clone(),
                         receiver_account.clone(),
@@ -212,6 +299,94 @@ impl Processor {
             .ok_or(RoshamboError::AmountOverflow)?;
         **game_account.try_borrow_mut_lamports()? = 0;
         *game_account.try_borrow_mut_data()? = &mut [];
+
+        Ok(())
+    }
+
+    fn process_update_config(
+        accounts: &[AccountInfo],
+        min_bet_amount: u64,
+        max_bet_amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+
+        let config_creator = next_account_info(account_info_iter)?;
+        if !config_creator.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let config_account = next_account_info(account_info_iter)?;
+
+        // Check if this config account is already initialize
+        let mut config_info = Config::unpack_unchecked(&config_account.try_borrow_data()?)?;
+        if !config_info.is_initialized() {
+            return Err(ProgramError::UninitializedAccount);
+        }
+
+        // Check if the signer has authority to update the config
+        if config_info.owner_pubkey != *config_creator.key {
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+
+        // Update game account with new game data
+        config_info.min_bet_amount = min_bet_amount;
+        config_info.max_bet_amount = max_bet_amount;
+        Config::pack(config_info, &mut config_account.try_borrow_mut_data()?)?;
+
+        Ok(())
+    }
+
+    fn process_withdraw(
+        accounts: &[AccountInfo],
+        amount: u64,
+        program_id: &Pubkey,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+
+        let config_creator = next_account_info(account_info_iter)?;
+        if !config_creator.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let config_account = next_account_info(account_info_iter)?;
+
+        // Check if this config account is already initialize
+        let config_info = Config::unpack_unchecked(&config_account.try_borrow_data()?)?;
+        if !config_info.is_initialized() {
+            return Err(ProgramError::UninitializedAccount);
+        }
+
+        // Check if the signer has authority to update the config
+        if config_info.owner_pubkey != *config_creator.key {
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+
+        // Withdraw
+        let house_token_account = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+        let pda_program = next_account_info(account_info_iter)?;
+        let (pda, nonce) = Pubkey::find_program_address(&[b"roshambo"], program_id);
+
+        let withdraw_ix = spl_token::instruction::transfer(
+            token_program.key,
+            house_token_account.key,
+            config_creator.key,
+            &pda,
+            &[&pda],
+            amount,
+        )?;
+
+        msg!("Refund bet amount when draw...");
+        invoke_signed(
+            &withdraw_ix,
+            &[
+                house_token_account.clone(),
+                config_creator.clone(),
+                pda_program.clone(),
+                token_program.clone(),
+            ],
+            &[&[&b"roshambo"[..], &[nonce]]],
+        )?;
 
         Ok(())
     }
